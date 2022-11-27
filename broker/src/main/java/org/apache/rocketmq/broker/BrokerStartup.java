@@ -45,6 +45,7 @@ import org.apache.rocketmq.store.config.MessageStoreConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import static org.apache.rocketmq.common.MixAll.ROCKETMQ_HOME_PROPERTY;
 import static org.apache.rocketmq.remoting.netty.TlsSystemConfig.TLS_ENABLE;
 
 public class BrokerStartup {
@@ -55,6 +56,7 @@ public class BrokerStartup {
     public static final SystemConfigFileHelper CONFIG_FILE_HELPER = new SystemConfigFileHelper();
 
     public static void main(String[] args) {
+        System.setProperty(ROCKETMQ_HOME_PROPERTY, "/Users/tigerweili/dev/rocketmq");
         start(createBrokerController(args));
     }
 

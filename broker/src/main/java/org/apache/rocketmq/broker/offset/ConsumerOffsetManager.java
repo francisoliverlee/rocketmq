@@ -37,6 +37,8 @@ import org.apache.rocketmq.remoting.protocol.RemotingSerializable;
 
 public class ConsumerOffsetManager extends ConfigManager {
     private static final InternalLogger LOG = InternalLoggerFactory.getLogger(LoggerName.BROKER_LOGGER_NAME);
+    private static final InternalLogger POP_LOGGER = InternalLoggerFactory.getLogger(LoggerName.ROCKETMQ_POP_LOGGER_NAME);
+
     public static final String TOPIC_GROUP_SEPARATOR = "@";
 
     private DataVersion dataVersion = new DataVersion();
@@ -178,6 +180,11 @@ public class ConsumerOffsetManager extends ConfigManager {
 
     public void commitOffset(final String clientHost, final String group, final String topic, final int queueId,
         final long offset) {
+
+        POP_LOGGER.debug("commitOffset, clientHost={}, group={}, topic={}, queueId={}, offset={}",
+                clientHost,group, topic,queueId,offset
+        );
+
         // topic@group
         String key = topic + TOPIC_GROUP_SEPARATOR + group;
         this.commitOffset(clientHost, key, queueId, offset);

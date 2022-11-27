@@ -54,6 +54,8 @@ import org.apache.rocketmq.remoting.protocol.RemotingCommand;
 import org.apache.rocketmq.srvutil.ServerUtil;
 import org.slf4j.LoggerFactory;
 
+import static org.apache.rocketmq.common.MixAll.ROCKETMQ_HOME_PROPERTY;
+
 public class ProxyStartup {
     private static final InternalLogger log = InternalLoggerFactory.getLogger(LoggerName.PROXY_LOGGER_NAME);
     private static final ProxyStartAndShutdown PROXY_START_AND_SHUTDOWN = new ProxyStartAndShutdown();

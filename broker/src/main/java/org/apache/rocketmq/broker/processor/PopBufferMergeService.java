@@ -40,12 +40,15 @@ import org.apache.rocketmq.store.config.BrokerRole;
 import org.apache.rocketmq.store.pop.AckMsg;
 import org.apache.rocketmq.store.pop.PopCheckPoint;
 
+// ck buffer信息合并服务
+// 1. 清理不需要buffer的ck消息， 保存过期没有ack 的ck
+// 2. 满足条件的ck信息：提交位点
 public class PopBufferMergeService extends ServiceThread {
     private static final InternalLogger POP_LOGGER = InternalLoggerFactory.getLogger(LoggerName.ROCKETMQ_POP_LOGGER_NAME);
-    ConcurrentHashMap<String/*mergeKey*/, PopCheckPointWrapper>
-        buffer = new ConcurrentHashMap<>(1024 * 16);
-    ConcurrentHashMap<String/*topic@cid@queueId*/, QueueWithTime<PopCheckPointWrapper>> commitOffsets =
-        new ConcurrentHashMap<>();
+    // 缓存ck， 每次pop保存一对 kv
+    ConcurrentHashMap<String/*mergeKey*/, PopCheckPointWrapper> buffer = new ConcurrentHashMap<>(1024 * 16);
+    // 保存ck， 按照 message queue 保存 ck消息
+    ConcurrentHashMap<String/*topic@cid@queueId*/, QueueWithTime<PopCheckPointWrapper>> commitOffsets = new ConcurrentHashMap<>();
     private volatile boolean serving = true;
     private AtomicInteger counter = new AtomicInteger(0);
     private int scanTimes = 0;
@@ -133,12 +136,24 @@ public class PopBufferMergeService extends ServiceThread {
             Map.Entry<String, QueueWithTime<PopCheckPointWrapper>> entry = iterator.next();
             LinkedBlockingDeque<PopCheckPointWrapper> queue = entry.getValue().get();
             PopCheckPointWrapper pointWrapper;
+
             while ((pointWrapper = queue.peek()) != null) {
+                POP_LOGGER.debug("[scanCommitOffset] ck ={}", pointWrapper);
+                POP_LOGGER.debug("[scanCommitOffset] isJustOffset={}, isCkStored={}, isCkDone={}, isCkDoneForFinish={}, isCkStored={}, ck ={}",
+                        pointWrapper.isJustOffset(),
+                        pointWrapper.isCkStored(),
+                        isCkDone(pointWrapper),
+                        isCkDoneForFinish(pointWrapper),
+                        pointWrapper.isCkStored(),
+                        pointWrapper.toString()
+                );
                 // 1. just offset & stored, not processed by scan
                 // 2. ck is buffer(acked)
                 // 3. ck is buffer(not all acked), all ak are stored and ck is stored
-                if (pointWrapper.isJustOffset() && pointWrapper.isCkStored() || isCkDone(pointWrapper)
-                    || isCkDoneForFinish(pointWrapper) && pointWrapper.isCkStored()) {
+                if (pointWrapper.isJustOffset() && pointWrapper.isCkStored() ||
+                        isCkDone(pointWrapper) ||
+                        isCkDoneForFinish(pointWrapper) && pointWrapper.isCkStored()
+                ) {
                     if (commitOffset(pointWrapper)) {
                         queue.poll();
                     } else {
@@ -209,6 +224,12 @@ public class PopBufferMergeService extends ServiceThread {
         }
     }
 
+    /**
+     * 扫描buffer中的每个ck消息， 将满足条件的ck消息清理掉
+     * 1。 ck中的消息在ck持久化前，前部已经被ack了，并且消费位点已经更新，可以删除
+     * 2。超时没有处理， 则持久化到topic中，等PopReviveService 异步匹配ack 和 ck消息
+     *
+     */
     private void scan() {
         long startTime = System.currentTimeMillis();
         int count = 0, countCk = 0;
@@ -216,10 +237,21 @@ public class PopBufferMergeService extends ServiceThread {
         while (iterator.hasNext()) {
             Map.Entry<String, PopCheckPointWrapper> entry = iterator.next();
             PopCheckPointWrapper pointWrapper = entry.getValue();
+            POP_LOGGER.info("pop-scan, pointWrapper={}", pointWrapper.toString());
+
+            POP_LOGGER.info("pop-scan, isJustOffset={}, isCkStored={}, isCkDone={}, isCkDoneForFinish={}, isCkStored={}",
+                    pointWrapper.isJustOffset(),
+                    pointWrapper.isCkStored(),
+                    isCkDone(pointWrapper),
+                    isCkDoneForFinish(pointWrapper) ,
+                    pointWrapper.isCkStored()
+            );
 
             // just process offset(already stored at pull thread), or buffer ck(not stored and ack finish)
-            if (pointWrapper.isJustOffset() && pointWrapper.isCkStored() || isCkDone(pointWrapper)
-                || isCkDoneForFinish(pointWrapper) && pointWrapper.isCkStored()) {
+            if (pointWrapper.isJustOffset() && pointWrapper.isCkStored() || // 不是真正的ck消息，仅仅保存offset， 并且已经保存了
+                    isCkDone(pointWrapper) || // 当前ck消息中全部的消息都被ack了
+                    isCkDoneForFinish(pointWrapper) && pointWrapper.isCkStored() //  判断ck 消息对应的全部消息是否 都 ack 和 保存了
+            ) {
                 if (brokerController.getBrokerConfig().isEnablePopLog()) {
                     POP_LOGGER.info("[PopBuffer]ck done, {}", pointWrapper);
                 }
@@ -248,32 +280,49 @@ public class PopBufferMergeService extends ServiceThread {
 
             // double check
             if (isCkDone(pointWrapper)) {
+                POP_LOGGER.debug("[PopBuffer] ck finish  continue");
                 continue;
-            } else if (pointWrapper.isJustOffset()) {
+            } else if (pointWrapper.isJustOffset()) { // 还没有完成， ck保存到 磁盘上
                 // just offset should be in store.
                 if (pointWrapper.getReviveQueueOffset() < 0) {
+                    POP_LOGGER.debug("[PopBuffer] ck save to disk for just offset");
                     putCkToStore(pointWrapper, false);
                     countCk++;
                 }
                 continue;
-            } else if (removeCk) {
+            } else if (removeCk) {  // 超时后， ck保存到磁盘上
                 // put buffer ak to store
                 if (pointWrapper.getReviveQueueOffset() < 0) {
                     putCkToStore(pointWrapper, false);
+                    POP_LOGGER.debug("[PopBuffer] ck save to disk for timeout");
                     countCk++;
                 }
 
                 if (!pointWrapper.isCkStored()) {
+                    POP_LOGGER.debug("[PopBuffer] continue for !isCkStored");
                     continue;
                 }
 
                 for (byte i = 0; i < point.getNum(); i++) {
+                    POP_LOGGER.debug("[PopBuffer] i={}, bits={}, store bits={}, r={}",
+                            i,
+                            pointWrapper.getBits(),
+                            pointWrapper.getToStoreBits(),
+                            DataConverter.getBit(pointWrapper.getToStoreBits().get(), i)
+                    );
                     // reput buffer ak to store
                     if (DataConverter.getBit(pointWrapper.getBits().get(), i)
                         && !DataConverter.getBit(pointWrapper.getToStoreBits().get(), i)) {
                         if (putAckToStore(pointWrapper, i)) {
                             count++;
                             markBitCAS(pointWrapper.getToStoreBits(), i);
+
+                            POP_LOGGER.debug("[PopBuffer] i={}, bits={}, store bits={}, r={}",
+                                    i,
+                                    pointWrapper.getBits(),
+                                    pointWrapper.getToStoreBits(),
+                                    DataConverter.getBit(pointWrapper.getToStoreBits().get(), i)
+                            );
                         }
                     }
                 }
@@ -289,6 +338,7 @@ public class PopBufferMergeService extends ServiceThread {
             }
         }
 
+        // 扫描 并 提交 位点
         int offsetBufferSize = scanCommitOffset();
 
         long eclipse = System.currentTimeMillis() - startTime;
@@ -350,6 +400,8 @@ public class PopBufferMergeService extends ServiceThread {
         }
         try {
             final long offset = brokerController.getConsumerOffsetManager().queryOffset(popCheckPoint.getCId(), popCheckPoint.getTopic(), popCheckPoint.getQueueId());
+            POP_LOGGER.debug("commitOffset, lockKey={}, offset={}", lockKey, offset);
+
             if (wrapper.getNextBeginOffset() > offset) {
                 if (brokerController.getBrokerConfig().isEnablePopLog()) {
                     POP_LOGGER.info("Commit offset, {}, {}", wrapper, offset);
@@ -397,6 +449,14 @@ public class PopBufferMergeService extends ServiceThread {
      * @return
      */
     public void addCkJustOffset(PopCheckPoint point, int reviveQueueId, long reviveQueueOffset, long nextBeginOffset) {
+
+        POP_LOGGER.debug("addCkJustOffset point={}, reviveQueueId={}, reviveQueueOffset={}, nextBeginOffset={}",
+                point.toString(),
+                reviveQueueId,
+                reviveQueueOffset,
+                nextBeginOffset
+        );
+
         PopCheckPointWrapper pointWrapper = new PopCheckPointWrapper(reviveQueueId, reviveQueueOffset, point, nextBeginOffset, true);
 
         this.putCkToStore(pointWrapper, !checkQueueOk(pointWrapper));
@@ -468,6 +528,7 @@ public class PopBufferMergeService extends ServiceThread {
         return true;
     }
 
+    // 添加ack消息，修改 bit map
     public boolean addAk(int reviveQid, AckMsg ackMsg) {
         if (!brokerController.getBrokerConfig().isEnablePopBufferMerge()) {
             return false;
@@ -505,6 +566,7 @@ public class PopBufferMergeService extends ServiceThread {
                 return false;
             }
 
+            // 根据ack 的offset， 获取到这个消息在pop这批消息中的索引下标，标记bit map， 表示消息已经ack
             int indexOfAck = point.indexOfAck(ackMsg.getAckOffset());
             if (indexOfAck > -1) {
                 markBitCAS(pointWrapper.getBits(), indexOfAck);
@@ -629,6 +691,7 @@ public class PopBufferMergeService extends ServiceThread {
         return true;
     }
 
+    // 本次ck的全部消息都ack
     private boolean isCkDone(PopCheckPointWrapper pointWrapper) {
         byte num = pointWrapper.getCk().getNum();
         for (byte i = 0; i < num; i++) {
@@ -639,6 +702,7 @@ public class PopBufferMergeService extends ServiceThread {
         return true;
     }
 
+    //  判断ck 消息对应的全部消息是否 都 ack 和 保存了
     private boolean isCkDoneForFinish(PopCheckPointWrapper pointWrapper) {
         byte num = pointWrapper.getCk().getNum();
         int bits = pointWrapper.getBits().get() ^ pointWrapper.getToStoreBits().get();
@@ -678,13 +742,19 @@ public class PopBufferMergeService extends ServiceThread {
         private volatile long reviveQueueOffset;
         private final PopCheckPoint ck;
         // bit for concurrent
+        // bitmap， 标记每个offset对应的消息的ack状态
         private final AtomicInteger bits;
         // bit for stored buffer ak
+        // bitmap，标记每个buffer的 ck 消息的ack 消息是否已经保存 在topic中了
         private final AtomicInteger toStoreBits;
         private final long nextBeginOffset;
         private final String lockKey;
         private final String mergeKey;
+        // 没有pop到消息， 消息diff 列表 + 消息条数 是空的
+        // 只是为了把进度往前推
+        // 当前ck不是真正的ck，仅仅为了保存offset而已
         private final boolean justOffset;
+        // ck消息被保存在 commit offset map中
         private volatile boolean ckStored = false;
 
         public PopCheckPointWrapper(int reviveQueueId, long reviveQueueOffset, PopCheckPoint point,
@@ -765,14 +835,14 @@ public class PopBufferMergeService extends ServiceThread {
         @Override
         public String toString() {
             final StringBuilder sb = new StringBuilder("CkWrap{");
-            sb.append("rq=").append(reviveQueueId);
-            sb.append(", rqo=").append(reviveQueueOffset);
+            sb.append("reviveQueueId=").append(reviveQueueId);
+            sb.append(", reviveQueueOffset=").append(reviveQueueOffset);
             sb.append(", ck=").append(ck);
             sb.append(", bits=").append(bits);
-            sb.append(", sBits=").append(toStoreBits);
-            sb.append(", nbo=").append(nextBeginOffset);
-            sb.append(", cks=").append(ckStored);
-            sb.append(", jo=").append(justOffset);
+            sb.append(", toStoreBits=").append(toStoreBits);
+            sb.append(", nextBeginOffset=").append(nextBeginOffset);
+            sb.append(", ckStored=").append(ckStored);
+            sb.append(", justOffset=").append(justOffset);
             sb.append('}');
             return sb.toString();
         }

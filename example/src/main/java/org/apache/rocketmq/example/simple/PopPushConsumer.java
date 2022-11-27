@@ -29,12 +29,14 @@ import org.apache.rocketmq.tools.admin.DefaultMQAdminExt;
 
 public class PopPushConsumer {
 
-    public static final String CONSUMER_GROUP = "CID_JODIE_1";
-    public static final String TOPIC = "TopicTest";
+    public static final String CONSUMER_GROUP = "test-group1";
+    public static final String TOPIC = "TopicTestLocal";
+    public static final String NAMESRV_ADDR = "9.134.241.105:9876";
 
     // Or use AdminTools directly: mqadmin setConsumeMode -c cluster -t topic -g group -m POP -n 8
     private static void switchPop() throws Exception {
         DefaultMQAdminExt mqAdminExt = new DefaultMQAdminExt();
+        mqAdminExt.setNamesrvAddr(NAMESRV_ADDR);
         mqAdminExt.start();
 
         ClusterInfo clusterInfo = mqAdminExt.examineBrokerClusterInfo();
@@ -50,6 +52,7 @@ public class PopPushConsumer {
 
         DefaultMQPushConsumer consumer = new DefaultMQPushConsumer(CONSUMER_GROUP);
         consumer.subscribe(TOPIC, "*");
+        consumer.setNamesrvAddr(NAMESRV_ADDR);
         consumer.setConsumeFromWhere(ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET);
         consumer.registerMessageListener((MessageListenerConcurrently) (msgs, context) -> {
             System.out.printf("%s Receive New Messages: %s %n", Thread.currentThread().getName(), msgs);

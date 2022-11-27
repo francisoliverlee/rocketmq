@@ -352,6 +352,9 @@ public class PopMessageProcessor implements NettyRequestProcessor {
         long restNum = 0;
         boolean needRetry = randomQ % 5 == 0;
         long popTime = System.currentTimeMillis();
+
+        POP_LOGGER.debug("pop request for reviveQid = {}, needRetry={}", reviveQid, needRetry);
+
         if (needRetry && !requestHeader.isOrder()) {
             TopicConfig retryTopicConfig =
                 this.brokerController.getTopicConfigManager().selectTopicConfig(KeyBuilder.buildPopRetryTopic(requestHeader.getTopic(), requestHeader.getConsumerGroup()));
@@ -466,17 +469,21 @@ public class PopMessageProcessor implements NettyRequestProcessor {
         Channel channel, long popTime,
         ExpressionMessageFilter messageFilter, StringBuilder startOffsetInfo,
         StringBuilder msgOffsetInfo, StringBuilder orderCountInfo) {
+
+        POP_LOGGER.debug("popMsgFromQueue isRetry={}, header={}, popTime={}", isRetry, requestHeader.toString(), popTime);
         String topic = isRetry ? KeyBuilder.buildPopRetryTopic(requestHeader.getTopic(),
             requestHeader.getConsumerGroup()) : requestHeader.getTopic();
         String lockKey =
             topic + PopAckConstants.SPLIT + requestHeader.getConsumerGroup() + PopAckConstants.SPLIT + queueId;
         boolean isOrder = requestHeader.isOrder();
         long offset = getPopOffset(topic, requestHeader, queueId, false, lockKey);
+
         if (!queueLockManager.tryLock(lockKey)) {
             restNum = this.brokerController.getMessageStore().getMaxOffsetInQueue(topic, queueId) - offset + restNum;
             return restNum;
         }
         offset = getPopOffset(topic, requestHeader, queueId, true, lockKey);
+
         GetMessageResult getMessageTmpResult = null;
         try {
             if (isOrder && brokerController.getConsumerOrderInfoManager().checkBlock(topic,
@@ -534,6 +541,13 @@ public class PopMessageProcessor implements NettyRequestProcessor {
                 ExtraInfoUtil.buildStartOffsetInfo(startOffsetInfo, isRetry, queueId, offset);
                 ExtraInfoUtil.buildMsgOffsetInfo(msgOffsetInfo, isRetry, queueId,
                     getMessageTmpResult.getMessageQueueOffset());
+
+                POP_LOGGER.debug("popMsgFromQueue startOffsetInfo={}, \nmsgOffsetInfo={},\norderCountInfo={}",
+                        startOffsetInfo != null ? startOffsetInfo.toString() : null,
+                        msgOffsetInfo != null ? msgOffsetInfo.toString() : null,
+                        orderCountInfo != null ? orderCountInfo.toString(): null
+                );
+
             } else if ((GetMessageStatus.NO_MATCHED_MESSAGE.equals(getMessageTmpResult.getStatus())
                 || GetMessageStatus.OFFSET_FOUND_NULL.equals(getMessageTmpResult.getStatus())
                 || GetMessageStatus.MESSAGE_WAS_REMOVING.equals(getMessageTmpResult.getStatus())
@@ -561,12 +575,17 @@ public class PopMessageProcessor implements NettyRequestProcessor {
         String lockKey) {
         long offset = this.brokerController.getConsumerOffsetManager().queryOffset(requestHeader.getConsumerGroup(),
             topic, queueId);
+
+        POP_LOGGER.debug("getPopOffset offset={} ,init={}, queueId={}, lockKey={}", offset, init, queueId, lockKey);
         if (offset < 0) {
             if (ConsumeInitMode.MIN == requestHeader.getInitMode()) {
                 offset = this.brokerController.getMessageStore().getMinOffsetInQueue(topic, queueId);
+                POP_LOGGER.debug("getPopOffset getInitMode={}, offset={} , lockKey={}", requestHeader.getInitMode(),offset, lockKey);
             } else {
                 // pop last one,then commit offset.
                 offset = this.brokerController.getMessageStore().getMaxOffsetInQueue(topic, queueId) - 1;
+                POP_LOGGER.debug("getPopOffset getInitMode={}, offset={} , lockKey={}", requestHeader.getInitMode(),offset, lockKey);
+
                 // max & no consumer offset
                 if (offset < 0) {
                     offset = 0;
@@ -579,6 +598,8 @@ public class PopMessageProcessor implements NettyRequestProcessor {
             }
         }
         long bufferOffset = this.popBufferMergeService.getLatestOffset(lockKey);
+        POP_LOGGER.debug("getPopOffset offset={} , bufferOffset={}, lockKey={}", offset, bufferOffset, lockKey);
+
         if (bufferOffset < 0) {
             return offset;
         } else {
@@ -688,9 +709,17 @@ public class PopMessageProcessor implements NettyRequestProcessor {
             ck, reviveQid, -1, getMessageTmpResult.getNextBeginOffset()
         );
 
+        POP_LOGGER.debug("appendCheckPoint ck={}, reviveQid={}, getNextBeginOffset={}, addBufferSuc={}",
+                ck.toString(),
+                reviveQid,
+                getMessageTmpResult.getNextBeginOffset(),
+                addBufferSuc
+        );
+
         if (addBufferSuc) {
             return;
         }
+
 
         this.popBufferMergeService.addCkJustOffset(
             ck, reviveQid, -1, getMessageTmpResult.getNextBeginOffset()

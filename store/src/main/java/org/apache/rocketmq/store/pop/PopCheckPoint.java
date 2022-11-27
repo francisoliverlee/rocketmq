@@ -21,7 +21,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class PopCheckPoint {
-    // 本次pop拉取消息的起始 message queue offset
+    // 本次pop拉取消息的起始 message queue offset, pop offset
     @JSONField(name = "so")
     private long startOffset;
     // pop发生的时间，单位毫秒
@@ -45,13 +45,14 @@ public class PopCheckPoint {
     // 消费者组id
     @JSONField(name = "c")
     private String cid;
-    // 恢复 位点？？？
+    // 需要恢复的消息 message queue offset
     @JSONField(name = "ro")
     private long reviveOffset;
-    // 消息位点差 xxx - yyy ???
-    //
+    // 消息位点差 message queue offset - pop offset
+    // 可以根据 startOffset 和 queueOffsetDiff， 计算得到当前pop中每个消息的message queue offset
     @JSONField(name = "d")
     private List<Integer> queueOffsetDiff;
+    // 从哪个broker pop的消息
     @JSONField(name = "bn")
     String brokerName;
 
@@ -158,12 +159,17 @@ public class PopCheckPoint {
         this.queueOffsetDiff.add(diff);
     }
 
+    /*
+    * 根据ack的消息位点， 查找消息对应的下标 index
+    * <img src="https://km.woa.com/asset/d9ab5e83614140d9bad09548fc16eb61?height=917&width=1080" />
+    * */
     public int indexOfAck(long ackOffset) {
         if (ackOffset < startOffset) {
             return -1;
         }
 
         // old version of checkpoint
+        // 兼容旧ck消息格式
         if (queueOffsetDiff == null || queueOffsetDiff.isEmpty()) {
 
             if (ackOffset - startOffset < num) {

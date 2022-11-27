@@ -19,6 +19,7 @@ package org.apache.rocketmq.common.utils;
 import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
 
+// bitmap的一个简单实现， 判断 index是否已经存在
 public class DataConverter {
     public static Charset charset = Charset.forName("UTF-8");
 

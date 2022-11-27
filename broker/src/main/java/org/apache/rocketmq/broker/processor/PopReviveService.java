@@ -48,6 +48,8 @@ import org.apache.rocketmq.store.PutMessageResult;
 import org.apache.rocketmq.store.pop.AckMsg;
 import org.apache.rocketmq.store.pop.PopCheckPoint;
 
+// 过了可见时间的消息， 重新恢复到可以正常消费
+// 每个 恢复 queue 一个服务， 默认8个服务。 消息全部恢复到 重试topic中
 public class PopReviveService extends ServiceThread {
     private static final InternalLogger POP_LOGGER = InternalLoggerFactory.getLogger(LoggerName.ROCKETMQ_POP_LOGGER_NAME);
 
@@ -84,6 +86,8 @@ public class PopReviveService extends ServiceThread {
             return;
         }
         MessageExtBrokerInner msgInner = new MessageExtBrokerInner();
+        // 消息发送到retry topic
+        // 不是retry topic， 则build pop retry topic
         if (!popCheckPoint.getTopic().startsWith(MixAll.RETRY_GROUP_TOPIC_PREFIX)) {
             msgInner.setTopic(KeyBuilder.buildPopRetryTopic(popCheckPoint.getTopic(), popCheckPoint.getCId()));
         } else {
@@ -106,6 +110,8 @@ public class PopReviveService extends ServiceThread {
         }
         msgInner.setPropertiesString(MessageDecoder.messageProperties2String(msgInner.getProperties()));
         addRetryTopicIfNoExit(msgInner.getTopic(), popCheckPoint.getCId());
+
+        // pop消息丢入重试topic
         PutMessageResult putMessageResult = brokerController.getEscapeBridge().putMessageToSpecificQueue(msgInner);
         if (brokerController.getBrokerConfig().isEnablePopLog()) {
             POP_LOGGER.info("reviveQueueId={},retry msg , ck={}, msg queueId {}, offset {}, reviveDelay={}, result is {} ",
@@ -385,6 +391,9 @@ public class PopReviveService extends ServiceThread {
 
             newOffset = popCheckPoint.getReviveOffset();
         }
+
+        // 消息恢复到哪个offset， 则提交这个offset，新的消息会有新的offset
+        // 每个消息恢复会有一个新的消息id
         if (newOffset > consumeReviveObj.oldOffset) {
             if (!shouldRunPopRevive) {
                 POP_LOGGER.info("slave skip commit, revive topic={}, reviveQueueId={}", reviveTopic, queueId);
@@ -395,6 +404,7 @@ public class PopReviveService extends ServiceThread {
         consumeReviveObj.newOffset = newOffset;
     }
 
+    // ack 与ck消息匹配
     private void reviveMsgFromCk(PopCheckPoint popCheckPoint) throws Throwable {
         for (int j = 0; j < popCheckPoint.getNum(); j++) {
             if (DataConverter.getBit(popCheckPoint.getBitMap(), j)) {
