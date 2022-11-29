@@ -228,6 +228,15 @@ public class PopBufferMergeService extends ServiceThread {
      * 扫描buffer中的每个ck消息， 将满足条件的ck消息清理掉
      * 1。 ck中的消息在ck持久化前，前部已经被ack了，并且消费位点已经更新，可以删除
      * 2。超时没有处理， 则持久化到topic中，等PopReviveService 异步匹配ack 和 ck消息
+     * buffer    持久化   ack全部完成    结果
+     * 0          0      0             无意义
+     * 0          0      1             无意义
+     * 0          1      0             ☑️
+     * 0          1      1             ☑️
+     * 1          0      0             ☑️
+     * 1          0      1             ☑️
+     * 1          1      0             无意义
+     * 1          1      1             无意义
      *
      */
     private void scan() {
@@ -248,8 +257,8 @@ public class PopBufferMergeService extends ServiceThread {
             );
 
             // just process offset(already stored at pull thread), or buffer ck(not stored and ack finish)
-            if (pointWrapper.isJustOffset() && pointWrapper.isCkStored() || // 不是真正的ck消息，仅仅保存offset， 并且已经保存了
-                    isCkDone(pointWrapper) || // 当前ck消息中全部的消息都被ack了
+            if (pointWrapper.isJustOffset() && pointWrapper.isCkStored() || // 不是真正的ck消息，仅仅保存offset， 并且ck已经持久化到恢复topic
+                    isCkDone(pointWrapper) || // buffer中，当前ck消息中全部的消息都被ack了
                     isCkDoneForFinish(pointWrapper) && pointWrapper.isCkStored() //  判断ck 消息对应的全部消息是否 都 ack 和 保存了
             ) {
                 if (brokerController.getBrokerConfig().isEnablePopLog()) {
@@ -311,9 +320,9 @@ public class PopBufferMergeService extends ServiceThread {
                             DataConverter.getBit(pointWrapper.getToStoreBits().get(), i)
                     );
                     // reput buffer ak to store
-                    if (DataConverter.getBit(pointWrapper.getBits().get(), i)
-                        && !DataConverter.getBit(pointWrapper.getToStoreBits().get(), i)) {
-                        if (putAckToStore(pointWrapper, i)) {
+                    if (DataConverter.getBit(pointWrapper.getBits().get(), i) // 第i个消息已经被ack了
+                        && !DataConverter.getBit(pointWrapper.getToStoreBits().get(), i)) { // 第i个消息没有保存恢复topic
+                        if (putAckToStore(pointWrapper, i)) { // 根据ck自动生成一个ack消息， 保存到恢复topic中
                             count++;
                             markBitCAS(pointWrapper.getToStoreBits(), i);
 
@@ -702,7 +711,7 @@ public class PopBufferMergeService extends ServiceThread {
         return true;
     }
 
-    //  判断ck 消息对应的全部消息是否 都 ack 和 保存了
+    //  判断ck 消息对应的全部消息是否 都 ack 和 持久化恢复topic
     private boolean isCkDoneForFinish(PopCheckPointWrapper pointWrapper) {
         byte num = pointWrapper.getCk().getNum();
         int bits = pointWrapper.getBits().get() ^ pointWrapper.getToStoreBits().get();
@@ -745,7 +754,7 @@ public class PopBufferMergeService extends ServiceThread {
         // bitmap， 标记每个offset对应的消息的ack状态
         private final AtomicInteger bits;
         // bit for stored buffer ak
-        // bitmap，标记每个buffer的 ck 消息的ack 消息是否已经保存 在topic中了
+        // bitmap，标记当前ck消息的全部 ack 消息是否已经保存 在topic中了
         private final AtomicInteger toStoreBits;
         private final long nextBeginOffset;
         private final String lockKey;
@@ -754,7 +763,7 @@ public class PopBufferMergeService extends ServiceThread {
         // 只是为了把进度往前推
         // 当前ck不是真正的ck，仅仅为了保存offset而已
         private final boolean justOffset;
-        // ck消息被保存在 commit offset map中
+        // ck消息被持久化到 恢复topic中
         private volatile boolean ckStored = false;
 
         public PopCheckPointWrapper(int reviveQueueId, long reviveQueueOffset, PopCheckPoint point,

@@ -33,6 +33,7 @@ public class PushConsumer {
         consumer.setConsumeFromWhere(ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET);
         //wrong time format 2017_0422_221800
         consumer.setConsumeTimestamp("20181109221800");
+
         consumer.registerMessageListener(new MessageListenerConcurrently() {
 
             @Override
