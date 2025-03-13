@@ -24,6 +24,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.function.Function;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.rocketmq.common.Pair;
 import org.apache.rocketmq.common.BoundaryType;
 import org.apache.rocketmq.common.attribute.CQType;
 import org.apache.rocketmq.common.constant.LoggerName;
@@ -312,12 +313,31 @@ public class BatchConsumeQueue implements ConsumeQueueInterface {
     }
 
     @Override
+    public ReferredIterator<CqUnit> iterateFrom(long startIndex, int count) {
+        return iterateFrom(startIndex);
+    }
+
+    @Override
     public CqUnit get(long offset) {
         ReferredIterator<CqUnit> it = iterateFrom(offset);
         if (it == null) {
             return null;
         }
         return it.nextAndRelease();
+    }
+
+    @Override
+    public Pair<CqUnit, Long> getCqUnitAndStoreTime(long index) {
+        CqUnit cqUnit = get(index);
+        Long messageStoreTime = this.messageStore.getQueueStore().getStoreTime(cqUnit);
+        return new Pair<>(cqUnit, messageStoreTime);
+    }
+
+    @Override
+    public Pair<CqUnit, Long> getEarliestUnitAndStoreTime() {
+        CqUnit cqUnit = getEarliestUnit();
+        Long messageStoreTime = this.messageStore.getQueueStore().getStoreTime(cqUnit);
+        return new Pair<>(cqUnit, messageStoreTime);
     }
 
     @Override
@@ -567,7 +587,12 @@ public class BatchConsumeQueue implements ConsumeQueueInterface {
         MappedFile mappedFile = this.mappedFileQueue.getLastMappedFile(this.mappedFileQueue.getMaxOffset());
         if (mappedFile != null) {
             boolean isNewFile = isNewFile(mappedFile);
-            boolean appendRes = mappedFile.appendMessage(this.byteBufferItem.array());
+            boolean appendRes;
+            if (messageStore.getMessageStoreConfig().isPutConsumeQueueDataByFileChannel()) {
+                appendRes = mappedFile.appendMessageUsingFileChannel(this.byteBufferItem.array());
+            } else {
+                appendRes = mappedFile.appendMessage(this.byteBufferItem.array());
+            }
             if (appendRes) {
                 maxMsgPhyOffsetInCommitLog = offset;
                 maxOffsetInQueue = msgBaseOffset + batchSize;

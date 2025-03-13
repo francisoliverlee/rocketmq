@@ -30,7 +30,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-
+import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.rocketmq.broker.BrokerController;
 import org.apache.rocketmq.broker.out.BrokerOuterAPI;
@@ -224,7 +224,7 @@ public class ReplicasManager {
 
     public synchronized void changeBrokerRole(final Long newMasterBrokerId, final String newMasterAddress,
         final Integer newMasterEpoch,
-        final Integer syncStateSetEpoch, final Set<Long> syncStateSet) {
+        final Integer syncStateSetEpoch, final Set<Long> syncStateSet) throws Exception {
         if (newMasterBrokerId != null && newMasterEpoch > this.masterEpoch) {
             if (newMasterBrokerId.equals(this.brokerControllerId)) {
                 changeToMaster(newMasterEpoch, syncStateSetEpoch, syncStateSet);
@@ -234,7 +234,7 @@ public class ReplicasManager {
         }
     }
 
-    public void changeToMaster(final int newMasterEpoch, final int syncStateSetEpoch, final Set<Long> syncStateSet) {
+    public void changeToMaster(final int newMasterEpoch, final int syncStateSetEpoch, final Set<Long> syncStateSet) throws Exception {
         synchronized (this) {
             if (newMasterEpoch > this.masterEpoch) {
                 LOGGER.info("Begin to change to master, brokerName:{}, replicas:{}, new Epoch:{}", this.brokerConfig.getBrokerName(), this.brokerAddress, newMasterEpoch);
@@ -525,7 +525,7 @@ public class ReplicasManager {
             return true;
 
         } catch (Exception e) {
-            LOGGER.error("fail to apply broker id: {}", e, tempBrokerMetadata.getBrokerId());
+            LOGGER.error("fail to apply broker id: {}", tempBrokerMetadata.getBrokerId(), e);
             return false;
         }
     }
@@ -686,7 +686,7 @@ public class ReplicasManager {
     }
 
     /**
-     * Scheduling sync controller medata.
+     * Scheduling sync controller metadata.
      */
     private boolean schedulingSyncControllerMetadata() {
         // Get controller metadata first.
@@ -803,7 +803,10 @@ public class ReplicasManager {
 
     private void updateControllerAddr() {
         if (brokerConfig.isFetchControllerAddrByDnsLookup()) {
-            this.controllerAddresses = brokerOuterAPI.dnsLookupAddressByDomain(this.brokerConfig.getControllerAddr());
+            List<String> adders = brokerOuterAPI.dnsLookupAddressByDomain(this.brokerConfig.getControllerAddr());
+            if (CollectionUtils.isNotEmpty(adders)) {
+                this.controllerAddresses = adders;
+            }
         } else {
             final String controllerPaths = this.brokerConfig.getControllerAddr();
             final String[] controllers = controllerPaths.split(";");

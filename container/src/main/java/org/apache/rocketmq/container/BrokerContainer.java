@@ -83,7 +83,7 @@ public class BrokerContainer implements IBrokerContainer {
         this.nettyServerConfig = nettyServerConfig;
         this.nettyClientConfig = nettyClientConfig;
 
-        this.brokerOuterAPI = new BrokerOuterAPI(nettyClientConfig);
+        this.brokerOuterAPI = new BrokerOuterAPI(nettyClientConfig, null);
 
         this.brokerContainerProcessor = new BrokerContainerProcessor(this);
         this.brokerContainerProcessor.registerBrokerBootHook(this.brokerBootHookList);
@@ -164,7 +164,7 @@ public class BrokerContainer implements IBrokerContainer {
                         LOG.error("ScheduledTask fetchNameServerAddr exception", e);
                     }
                 }
-            }, 1000 * 10, 1000 * 60 * 2, TimeUnit.MILLISECONDS);
+            }, 1000 * 10, this.brokerContainerConfig.getUpdateNamesrvAddrInterval(), TimeUnit.MILLISECONDS);
         } else if (this.brokerContainerConfig.isFetchNamesrvAddrByAddressServer()) {
             this.scheduledExecutorService.scheduleAtFixedRate(new AbstractBrokerRunnable(BrokerIdentity.BROKER_CONTAINER_IDENTITY) {
 

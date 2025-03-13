@@ -16,8 +16,10 @@
  */
 package org.apache.rocketmq.common.config;
 
+import com.google.common.collect.Maps;
+import io.netty.buffer.PooledByteBufAllocator;
 import java.nio.ByteBuffer;
-import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -26,10 +28,6 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-
-import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
-
 import org.apache.rocketmq.common.ThreadFactoryImpl;
 import org.apache.rocketmq.common.constant.LoggerName;
 import org.apache.rocketmq.common.utils.ThreadUtils;
@@ -40,28 +38,35 @@ import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.ColumnFamilyOptions;
 import org.rocksdb.CompactRangeOptions;
 import org.rocksdb.CompactionOptions;
+import org.rocksdb.CompressionType;
 import org.rocksdb.DBOptions;
+import org.rocksdb.Env;
 import org.rocksdb.FlushOptions;
 import org.rocksdb.LiveFileMetaData;
 import org.rocksdb.Priority;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
-import org.rocksdb.RocksIterator;
 import org.rocksdb.Statistics;
 import org.rocksdb.Status;
 import org.rocksdb.WriteBatch;
 import org.rocksdb.WriteOptions;
 
-import static org.rocksdb.RocksDB.NOT_FOUND;
-
 public abstract class AbstractRocksDBStorage {
     protected static final Logger LOGGER = LoggerFactory.getLogger(LoggerName.ROCKSDB_LOGGER_NAME);
 
-    private static final Charset CHARSET_UTF8 = Charset.forName("UTF-8");
+    /**
+     * Direct Jemalloc allocator
+     */
+    public static final PooledByteBufAllocator POOLED_ALLOCATOR = new PooledByteBufAllocator(true);
+
+    public static final byte CTRL_0 = '\u0000';
+    public static final byte CTRL_1 = '\u0001';
+    public static final byte CTRL_2 = '\u0002';
+
     private static final String SPACE = " | ";
 
-    protected String dbPath;
+    protected final String dbPath;
     protected boolean readOnly;
     protected RocksDB db;
     protected DBOptions options;
@@ -76,21 +81,86 @@ public abstract class AbstractRocksDBStorage {
     protected CompactRangeOptions compactRangeOptions;
 
     protected ColumnFamilyHandle defaultCFHandle;
-    protected final List<ColumnFamilyOptions> cfOptions = new ArrayList();
+    protected final List<ColumnFamilyOptions> cfOptions = new ArrayList<>();
+    protected final List<ColumnFamilyHandle> cfHandles = new ArrayList<>();
 
     protected volatile boolean loaded;
+    protected CompressionType compressionType = CompressionType.LZ4_COMPRESSION;
     private volatile boolean closed;
 
     private final Semaphore reloadPermit = new Semaphore(1);
     private final ScheduledExecutorService reloadScheduler = ThreadUtils.newScheduledThreadPool(1, new ThreadFactoryImpl("RocksDBStorageReloadService_"));
     private final ThreadPoolExecutor manualCompactionThread = (ThreadPoolExecutor) ThreadUtils.newThreadPoolExecutor(
-            1, 1, 1000 * 60, TimeUnit.MILLISECONDS,
-            new ArrayBlockingQueue(1),
-            new ThreadFactoryImpl("RocksDBManualCompactionService_"),
-            new ThreadPoolExecutor.DiscardOldestPolicy());
+        1, 1, 1000 * 60, TimeUnit.MILLISECONDS,
+        new ArrayBlockingQueue<>(1),
+        new ThreadFactoryImpl("RocksDBManualCompactionService_"),
+        new ThreadPoolExecutor.DiscardOldestPolicy());
 
     static {
         RocksDB.loadLibrary();
+    }
+
+    public AbstractRocksDBStorage(String dbPath) {
+        this.dbPath = dbPath;
+    }
+
+    protected void initOptions() {
+        initWriteOptions();
+        initAbleWalWriteOptions();
+        initReadOptions();
+        initTotalOrderReadOptions();
+        initCompactRangeOptions();
+        initCompactionOptions();
+    }
+
+    /**
+     * Write options for <a href="https://github.com/facebook/rocksdb/wiki/Atomic-flush">Atomic Flush</a>
+     */
+    protected void initWriteOptions() {
+        this.writeOptions = new WriteOptions();
+        this.writeOptions.setSync(false);
+        this.writeOptions.setDisableWAL(true);
+        // https://github.com/facebook/rocksdb/wiki/Write-Stalls
+        this.writeOptions.setNoSlowdown(false);
+    }
+
+    protected void initAbleWalWriteOptions() {
+        this.ableWalWriteOptions = new WriteOptions();
+        this.ableWalWriteOptions.setSync(false);
+        this.ableWalWriteOptions.setDisableWAL(false);
+        // https://github.com/facebook/rocksdb/wiki/Write-Stalls
+        this.ableWalWriteOptions.setNoSlowdown(false);
+    }
+
+    protected void initReadOptions() {
+        this.readOptions = new ReadOptions();
+        this.readOptions.setPrefixSameAsStart(true);
+        this.readOptions.setTotalOrderSeek(false);
+        this.readOptions.setTailing(false);
+    }
+
+    protected void initTotalOrderReadOptions() {
+        this.totalOrderReadOptions = new ReadOptions();
+        this.totalOrderReadOptions.setPrefixSameAsStart(false);
+        this.totalOrderReadOptions.setTotalOrderSeek(true);
+        this.totalOrderReadOptions.setTailing(false);
+    }
+
+    protected void initCompactRangeOptions() {
+        this.compactRangeOptions = new CompactRangeOptions();
+        this.compactRangeOptions.setBottommostLevelCompaction(CompactRangeOptions.BottommostLevelCompaction.kForce);
+        this.compactRangeOptions.setAllowWriteStall(true);
+        this.compactRangeOptions.setExclusiveManualCompaction(false);
+        this.compactRangeOptions.setChangeLevel(true);
+        this.compactRangeOptions.setTargetLevel(-1);
+        this.compactRangeOptions.setMaxSubcompactions(4);
+    }
+
+    protected void initCompactionOptions() {
+        this.compactionOptions = new CompactionOptions();
+        this.compactionOptions.setCompression(compressionType);
+        this.compactionOptions.setMaxSubcompactions(4);
+        this.compactionOptions.setOutputFileSizeLimit(4 * 1024 * 1024 * 1024L);
     }
 
     public boolean hold() {
@@ -106,8 +176,8 @@ public abstract class AbstractRocksDBStorage {
     }
 
     protected void put(ColumnFamilyHandle cfHandle, WriteOptions writeOptions,
-                       final byte[] keyBytes, final int keyLen,
-                       final byte[] valueBytes, final int valueLen) throws RocksDBException {
+        final byte[] keyBytes, final int keyLen,
+        final byte[] valueBytes, final int valueLen) throws RocksDBException {
         if (!hold()) {
             throw new IllegalStateException("rocksDB:" + this + " is not ready");
         }
@@ -123,7 +193,7 @@ public abstract class AbstractRocksDBStorage {
     }
 
     protected void put(ColumnFamilyHandle cfHandle, WriteOptions writeOptions,
-                       final ByteBuffer keyBB, final ByteBuffer valueBB) throws RocksDBException {
+        final ByteBuffer keyBB, final ByteBuffer valueBB) throws RocksDBException {
         if (!hold()) {
             throw new IllegalStateException("rocksDB:" + this + " is not ready");
         }
@@ -164,13 +234,13 @@ public abstract class AbstractRocksDBStorage {
         }
     }
 
-    protected boolean get(ColumnFamilyHandle cfHandle, ReadOptions readOptions,
-                          final ByteBuffer keyBB, final ByteBuffer valueBB) throws RocksDBException {
+    protected int get(ColumnFamilyHandle cfHandle, ReadOptions readOptions, final ByteBuffer keyBB,
+        final ByteBuffer valueBB) throws RocksDBException {
         if (!hold()) {
             throw new IllegalStateException("rocksDB:" + this + " is not ready");
         }
         try {
-            return this.db.get(cfHandle, readOptions, keyBB, valueBB) != NOT_FOUND;
+            return this.db.get(cfHandle, readOptions, keyBB, valueBB);
         } catch (RocksDBException e) {
             LOGGER.error("get Failed. {}, {}", this.dbPath, getStatusError(e));
             throw e;
@@ -180,8 +250,8 @@ public abstract class AbstractRocksDBStorage {
     }
 
     protected List<byte[]> multiGet(final ReadOptions readOptions,
-                                    final List<ColumnFamilyHandle> columnFamilyHandleList,
-                                    final List<byte[]> keys) throws RocksDBException {
+        final List<ColumnFamilyHandle> columnFamilyHandleList,
+        final List<byte[]> keys) throws RocksDBException {
         if (!hold()) {
             throw new IllegalStateException("rocksDB:" + this + " is not ready");
         }
@@ -195,7 +265,8 @@ public abstract class AbstractRocksDBStorage {
         }
     }
 
-    protected void delete(ColumnFamilyHandle cfHandle, WriteOptions writeOptions, byte[] keyBytes) throws RocksDBException {
+    protected void delete(ColumnFamilyHandle cfHandle, WriteOptions writeOptions,
+        byte[] keyBytes) throws RocksDBException {
         if (!hold()) {
             throw new IllegalStateException("rocksDB:" + this + " is not ready");
         }
@@ -209,7 +280,8 @@ public abstract class AbstractRocksDBStorage {
         }
     }
 
-    protected void delete(ColumnFamilyHandle cfHandle, WriteOptions writeOptions, ByteBuffer keyBB) throws RocksDBException {
+    protected void delete(ColumnFamilyHandle cfHandle, WriteOptions writeOptions, ByteBuffer keyBB)
+        throws RocksDBException {
         if (!hold()) {
             throw new IllegalStateException("rocksDB:" + this + " is not ready");
         }
@@ -223,12 +295,8 @@ public abstract class AbstractRocksDBStorage {
         }
     }
 
-    protected WrappedRocksIterator newIterator(ColumnFamilyHandle cfHandle, ReadOptions readOptions) {
-        return new WrappedRocksIterator(this.db.newIterator(cfHandle, readOptions));
-    }
-
-    protected void rangeDelete(ColumnFamilyHandle cfHandle, WriteOptions writeOptions,
-                               final byte[] startKey, final byte[] endKey) throws RocksDBException {
+    protected void rangeDelete(ColumnFamilyHandle cfHandle, WriteOptions writeOptions, final byte[] startKey,
+        final byte[] endKey) throws RocksDBException {
         if (!hold()) {
             throw new IllegalStateException("rocksDB:" + this + " is not ready");
         }
@@ -240,46 +308,6 @@ public abstract class AbstractRocksDBStorage {
             throw e;
         } finally {
             release();
-        }
-    }
-
-    protected void manualCompactionDefaultCfMaxLevel(final CompactionOptions compactionOptions) throws Exception {
-        final ColumnFamilyHandle defaultCFHandle = this.defaultCFHandle;
-        final byte[] defaultCFName = defaultCFHandle.getName();
-        List<LiveFileMetaData> fileMetaDataList = this.db.getLiveFilesMetaData();
-        if (fileMetaDataList == null || fileMetaDataList.isEmpty()) {
-            return;
-        }
-
-        List<LiveFileMetaData> defaultLiveFileDataList = Lists.newArrayList();
-        List<String> inputFileNames = Lists.newArrayList();
-        int maxLevel = 0;
-        for (LiveFileMetaData fileMetaData : fileMetaDataList) {
-            if (compareTo(fileMetaData.columnFamilyName(), defaultCFName) != 0) {
-                continue;
-            }
-            defaultLiveFileDataList.add(fileMetaData);
-            if (fileMetaData.level() > maxLevel) {
-                maxLevel = fileMetaData.level();
-            }
-        }
-        if (maxLevel == 0) {
-            LOGGER.info("manualCompactionDefaultCfFiles skip level 0.");
-            return;
-        }
-
-        for (LiveFileMetaData fileMetaData : defaultLiveFileDataList) {
-            if (fileMetaData.level() != maxLevel || fileMetaData.beingCompacted()) {
-                continue;
-            }
-            inputFileNames.add(fileMetaData.path() + fileMetaData.fileName());
-        }
-        if (!inputFileNames.isEmpty()) {
-            List<String> outputLists = this.db.compactFiles(compactionOptions, defaultCFHandle,
-                    inputFileNames, maxLevel, -1, null);
-            LOGGER.info("manualCompactionDefaultCfFiles OK. src: {}, dst: {}", inputFileNames, outputLists);
-        } else {
-            LOGGER.info("manualCompactionDefaultCfFiles Empty.");
         }
     }
 
@@ -311,18 +339,20 @@ public abstract class AbstractRocksDBStorage {
         });
     }
 
-    protected void open(final List<ColumnFamilyDescriptor> cfDescriptors,
-                        final List<ColumnFamilyHandle> cfHandles) throws RocksDBException {
+    protected void open(final List<ColumnFamilyDescriptor> cfDescriptors) throws RocksDBException {
+        this.cfHandles.clear();
         if (this.readOnly) {
             this.db = RocksDB.openReadOnly(this.options, this.dbPath, cfDescriptors, cfHandles);
         } else {
             this.db = RocksDB.open(this.options, this.dbPath, cfDescriptors, cfHandles);
         }
-        this.db.getEnv().setBackgroundThreads(8, Priority.HIGH);
-        this.db.getEnv().setBackgroundThreads(8, Priority.LOW);
+        assert cfDescriptors.size() == cfHandles.size();
 
         if (this.db == null) {
             throw new RocksDBException("open rocksdb null");
+        }
+        try (Env env = this.db.getEnv()) {
+            env.setBackgroundThreads(8, Priority.LOW);
         }
     }
 
@@ -334,7 +364,7 @@ public abstract class AbstractRocksDBStorage {
         }
         if (postLoad()) {
             this.loaded = true;
-            LOGGER.info("start OK. {}", this.dbPath);
+            LOGGER.info("RocksDB [{}] starts OK", this.dbPath);
             this.closed = false;
             return true;
         } else {
@@ -342,11 +372,15 @@ public abstract class AbstractRocksDBStorage {
         }
     }
 
+    /**
+     * Close column family handles except the default column family
+     */
     protected abstract void preShutdown();
 
     public synchronized boolean shutdown() {
         try {
             if (!this.loaded) {
+                LOGGER.info("RocksDBStorage is not loaded, shutdown OK. dbPath={}, readOnly={}", this.dbPath, this.readOnly);
                 return true;
             }
 
@@ -359,11 +393,12 @@ public abstract class AbstractRocksDBStorage {
             }
             this.db.cancelAllBackgroundWork(true);
             this.db.pauseBackgroundWork();
-            //The close order is matter.
+            //The close order matters.
             //1. close column family handles
             preShutdown();
 
             this.defaultCFHandle.close();
+
             //2. close column family options.
             for (final ColumnFamilyOptions opt : this.cfOptions) {
                 opt.close();
@@ -381,15 +416,16 @@ public abstract class AbstractRocksDBStorage {
             if (this.totalOrderReadOptions != null) {
                 this.totalOrderReadOptions.close();
             }
-            if (this.options != null) {
-                this.options.close();
-            }
             //4. close db.
             if (db != null && !this.readOnly) {
                 this.db.syncWal();
             }
             if (db != null) {
                 this.db.closeE();
+            }
+            // Close DBOptions after RocksDB instance is closed.
+            if (this.options != null) {
+                this.options.close();
             }
             //5. help gc.
             this.cfOptions.clear();
@@ -401,27 +437,39 @@ public abstract class AbstractRocksDBStorage {
             this.options = null;
 
             this.loaded = false;
-            LOGGER.info("shutdown OK. {}", this.dbPath);
+            LOGGER.info("RocksDB shutdown OK. {}", this.dbPath);
         } catch (Exception e) {
-            LOGGER.error("shutdown Failed. {}", this.dbPath, e);
+            LOGGER.error("RocksDB shutdown failed. {}", this.dbPath, e);
             return false;
         }
         return true;
     }
 
-    public void flush(final FlushOptions flushOptions) {
+    public void flush(final FlushOptions flushOptions) throws RocksDBException {
+        flush(flushOptions, this.cfHandles);
+    }
+
+    public void flush(final FlushOptions flushOptions, List<ColumnFamilyHandle> columnFamilyHandles) throws RocksDBException {
         if (!this.loaded || this.readOnly || closed) {
             return;
         }
 
         try {
             if (db != null) {
-                this.db.flush(flushOptions);
+                // For atomic-flush, we have to explicitly specify column family handles
+                // See https://github.com/rust-rocksdb/rust-rocksdb/pull/793
+                // and https://github.com/facebook/rocksdb/blob/8ad4c7efc48d301f5e85467105d7019a49984dc8/include/rocksdb/db.h#L1667
+                this.db.flush(flushOptions, columnFamilyHandles);
             }
         } catch (RocksDBException e) {
             scheduleReloadRocksdb(e);
             LOGGER.error("flush Failed. {}, {}", this.dbPath, getStatusError(e));
+            throw e;
         }
+    }
+
+    public void flushWAL() throws RocksDBException {
+        this.db.flushWal(true);
     }
 
     public Statistics getStatistics() {
@@ -490,54 +538,6 @@ public abstract class AbstractRocksDBStorage {
         LOGGER.info("reload rocksdb OK. {}", this.dbPath);
     }
 
-    public void flushWAL() throws RocksDBException {
-        this.db.flushWal(true);
-    }
-
-    protected class WrappedRocksIterator {
-        private final RocksIterator iterator;
-
-        public WrappedRocksIterator(final RocksIterator iterator) {
-            this.iterator = iterator;
-        }
-
-        public byte[] key() {
-            return iterator.key();
-        }
-
-        public byte[] value() {
-            return iterator.value();
-        }
-
-        public void next() {
-            iterator.next();
-        }
-
-        public void prev() {
-            iterator.prev();
-        }
-
-        public void seek(byte[] target) {
-            iterator.seek(target);
-        }
-
-        public void seekForPrev(byte[] target) {
-            iterator.seekForPrev(target);
-        }
-
-        public void seekToFirst() {
-            iterator.seekToFirst();
-        }
-
-        public boolean isValid() {
-            return iterator.isValid();
-        }
-
-        public void close() {
-            iterator.close();
-        }
-    }
-
     private String getStatusError(RocksDBException e) {
         if (e == null || e.getStatus() == null) {
             return "null";
@@ -562,54 +562,32 @@ public abstract class AbstractRocksDBStorage {
 
     public void statRocksdb(Logger logger) {
         try {
+            // Log Memory Usage
+            String blockCacheMemUsage = this.db.getProperty("rocksdb.block-cache-usage");
+            String indexesAndFilterBlockMemUsage = this.db.getProperty("rocksdb.estimate-table-readers-mem");
+            String memTableMemUsage = this.db.getProperty("rocksdb.cur-size-all-mem-tables");
+            String blocksPinnedByIteratorMemUsage = this.db.getProperty("rocksdb.block-cache-pinned-usage");
+            logger.info("RocksDB Memory Usage: BlockCache: {}, IndexesAndFilterBlock: {}, MemTable: {}, BlocksPinnedByIterator: {}",
+                blockCacheMemUsage, indexesAndFilterBlockMemUsage, memTableMemUsage, blocksPinnedByIteratorMemUsage);
 
+            // Log file metadata by level
             List<LiveFileMetaData> liveFileMetaDataList = this.getCompactionStatus();
             if (liveFileMetaDataList == null || liveFileMetaDataList.isEmpty()) {
                 return;
             }
             Map<Integer, StringBuilder> map = Maps.newHashMap();
             for (LiveFileMetaData metaData : liveFileMetaDataList) {
-                StringBuilder sb = map.get(metaData.level());
-                if (sb == null) {
-                    sb = new StringBuilder(256);
-                    map.put(metaData.level(), sb);
-                }
-                sb.append(new String(metaData.columnFamilyName(), CHARSET_UTF8)).append(SPACE).
-                        append(metaData.fileName()).append(SPACE).
-                        append("s: ").append(metaData.size()).append(SPACE).
-                        append("a: ").append(metaData.numEntries()).append(SPACE).
-                        append("r: ").append(metaData.numReadsSampled()).append(SPACE).
-                        append("d: ").append(metaData.numDeletions()).append(SPACE).
-                        append(metaData.beingCompacted()).append("\n");
+                StringBuilder sb = map.computeIfAbsent(metaData.level(), k -> new StringBuilder(256));
+                sb.append(new String(metaData.columnFamilyName(), StandardCharsets.UTF_8)).append(SPACE).
+                    append(metaData.fileName()).append(SPACE).
+                    append("file-size: ").append(metaData.size()).append(SPACE).
+                    append("number-of-entries: ").append(metaData.numEntries()).append(SPACE).
+                    append("file-read-times: ").append(metaData.numReadsSampled()).append(SPACE).
+                    append("deletions: ").append(metaData.numDeletions()).append(SPACE).
+                    append("being-compacted: ").append(metaData.beingCompacted()).append("\n");
             }
-            for (Map.Entry<Integer, StringBuilder> entry : map.entrySet()) {
-                logger.info("level: {}\n{}", entry.getKey(), entry.getValue().toString());
-            }
-
-            String blockCacheMemUsage = this.db.getProperty("rocksdb.block-cache-usage");
-            String indexesAndFilterBlockMemUsage = this.db.getProperty("rocksdb.estimate-table-readers-mem");
-            String memTableMemUsage = this.db.getProperty("rocksdb.cur-size-all-mem-tables");
-            String blocksPinnedByIteratorMemUsage = this.db.getProperty("rocksdb.block-cache-pinned-usage");
-            logger.info("MemUsage. blockCache: {}, indexesAndFilterBlock: {}, memtable: {}, blocksPinnedByIterator: {}",
-                    blockCacheMemUsage, indexesAndFilterBlockMemUsage, memTableMemUsage, blocksPinnedByIteratorMemUsage);
+            map.forEach((key, value) -> logger.info("level: {}\n{}", key, value.toString()));
         } catch (Exception ignored) {
         }
-    }
-
-    public int compareTo(byte[] v1, byte[] v2) {
-        int len1 = v1.length;
-        int len2 = v2.length;
-        int lim = Math.min(len1, len2);
-
-        int k = 0;
-        while (k < lim) {
-            byte c1 = v1[k];
-            byte c2 = v2[k];
-            if (c1 != c2) {
-                return c1 - c2;
-            }
-            k++;
-        }
-        return len1 - len2;
     }
 }
